@@ -90,7 +90,12 @@ def fixture_and_container() -> dict:
         with wave.open(str(work / "a.wav"), "wb") as wf:
             wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SR)
             wf.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
-        mux = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(work / "v.mp4"),
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()  # runner 可能无系统 ffmpeg（2026-11-15 实测）
+        except Exception:
+            ffmpeg_exe = "ffmpeg"
+        mux = subprocess.run([ffmpeg_exe, "-y", "-loglevel", "error", "-i", str(work / "v.mp4"),
                               "-i", str(work / "a.wav"), "-c:v", "copy", "-c:a", "aac",
                               "-shortest", str(av_path)], capture_output=True, text=True)
         assert mux.returncode == 0, mux.stderr[-300:]
