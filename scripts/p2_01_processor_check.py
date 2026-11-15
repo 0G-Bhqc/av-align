@@ -231,6 +231,7 @@ def main() -> int:
 
         ids = np.array(model_inputs["input_ids"])[0]
         evidence["input_ids_len"] = int(len(ids))
+        OUTPUT.mkdir(parents=True, exist_ok=True)  # 落盘前建目录（原 bug：savez 先于 mkdir）
         np.savez_compressed(OUTPUT / "input_ids_b.npz", input_ids=ids)
 
         tok = processor.tokenizer
