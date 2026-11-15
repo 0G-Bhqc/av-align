@@ -128,7 +128,7 @@ def main() -> int:
             {"type": "video", "video": str(work / "av_silent.mp4")},
             {"type": "audio", "audio": audio_stream},
             {"type": "text", "text": QUESTION},
-        ]]}
+        ]}]
         text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
         inputs, proc_mode = None, None
         errs = []
