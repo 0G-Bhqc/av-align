@@ -63,6 +63,8 @@ def main():
 
     # 内核持久化防御：清理上次运行残留的 GPU 大张量（实测 38 万 token 输入会占满 40GiB）
     import gc
+    import numpy as np  # 条目循环的 np.stack 需要显式导入（exec -f 命名空间独立）
+    import torch
     stale_names = ("inputs", "replay_inputs", "out1", "out2", "out_replay", "out_pass",
                    "out_single", "out_both", "model_inputs", "pos_native", "LOGITS_ROW",
                    "ROW_TRUE", "P", "POS_SINGLE", "POS_BOTH", " thinker_output")
