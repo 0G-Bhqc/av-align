@@ -260,14 +260,19 @@ def interleave(
     chunks: Sequence[AudioChunk],
     mode: str,
     video_block_s: Optional[float] = None,
+    within_block_order: str = "audio_first",
 ) -> list[dict[str, Any]]:
     """生成媒体 token 序列。
 
     - mode="sequential"：全部视频帧（按 index）后接全部音频块（按 index）。
-    - mode="interleaved"：按时间合并；同刻平局规则——视频先于音频（schema 规则，
-      平局以 tie_rank 保证确定性）。
-    - video_block_s：把帧按时间分块（块内帧连续输出，块间按时间插入音频），
-      用于重述后端按秒块交错的打包方式；None 为逐帧合并。
+    - mode="interleaved"：
+      - video_block_s=None：按时间逐事件合并；同刻平局——视频先于音频（schema 规则，
+        平局以 tie_rank 保证确定性）。
+      - video_block_s=Δ：按 Δ 秒值域分块（重述后端按秒块交错的打包方式）。
+        within_block_order 决定块内顺序：
+        - "audio_first"：时间严格序（音频早于块起点则先于视频块输出）；
+        - "video_first"：每块先视频块后音频块（Transformers/MLX 后端的实际语义，
+          P0-01/P0-02 勘察确认）。
     """
     if mode == "sequential":
         seq: list[dict[str, Any]] = []
@@ -289,33 +294,38 @@ def interleave(
             {"modality": m, "ref": ref, "t_start": t0_, "t_end": t1_} for _, _, m, ref, t0_, t1_ in events
         ]
 
-    # 分块交错：块边界 = ceil((t - t_first)/block)；块内按 index；块间按块起点时间平局插音频
+    # 分块交错：窗口 [t_first + jΔ, t_first + (j+1)Δ)；全体窗口 = 视频窗 ∪ 音频窗，升序处理
     _check_finite("video_block_s", video_block_s)
     if video_block_s <= 0:
         raise LayoutError(f"video_block_s 必须为正: {video_block_s!r}")
+    if within_block_order not in ("audio_first", "video_first"):
+        raise LayoutError(f"未知块内顺序: {within_block_order!r}")
     if not frames:
         return interleave([], chunks, "interleaved", None)
     t_first = min(f.t_start for f in frames)
-    blocks: dict[int, list[FrameStamp]] = {}
+
+    def _window_key(t: float) -> int:
+        return int(math.floor((t - t_first) / video_block_s + TIME_EPS))
+
+    video_windows: dict[int, list[FrameStamp]] = {}
     for f in frames:
-        b = int(math.floor((f.t_start - t_first) / video_block_s + TIME_EPS))
-        blocks.setdefault(b, []).append(f)
-    block_starts = {b: min(f.t_start for f in fs) for b, fs in blocks.items()}
+        video_windows.setdefault(_window_key(f.t_start), []).append(f)
+    audio_windows: dict[int, list[AudioChunk]] = {}
+    for c in chunks:
+        audio_windows.setdefault(_window_key(c.t_start), []).append(c)
 
     seq2: list[dict[str, Any]] = []
-    chunk_events = [(c.t_start, c.index, c) for c in chunks]
-    chunk_events.sort(key=lambda e: (e[0], e[1]))
-    ci = 0
-    for b in sorted(blocks):
-        bt = block_starts[b]
-        while ci < len(chunk_events) and chunk_events[ci][0] < bt - TIME_EPS:
-            _, _, c = chunk_events[ci]
-            seq2.append({"modality": "audio", "ref": c.index, "t_start": c.t_start, "t_end": c.t_end})
-            ci += 1
-        for f in sorted(blocks[b], key=lambda x: x.index):
-            seq2.append({"modality": "video", "ref": f.index, "t_start": f.t_start, "t_end": f.t_end})
-    while ci < len(chunk_events):
-        _, _, c = chunk_events[ci]
-        seq2.append({"modality": "audio", "ref": c.index, "t_start": c.t_start, "t_end": c.t_end})
-        ci += 1
+    for b in sorted(set(video_windows) | set(audio_windows)):
+        wv = sorted(video_windows.get(b, []), key=lambda x: x.index)
+        wa = sorted(audio_windows.get(b, []), key=lambda x: x.index)
+        if within_block_order == "video_first":
+            # 后端重述语义：每窗先视频块后音频块（Transformers/MLX 的值域分块行为）
+            items: list[tuple[str, Any]] = [("video", f) for f in wv] + [("audio", c) for c in wa]
+        else:
+            # 同窗内时间严格序，平局视频先于音频（沿逐事件合并的 schema 规则）
+            events = [(f.t_start, 0, "video", f) for f in wv] + [(c.t_start, 1, "audio", c) for c in wa]
+            events.sort(key=lambda e: (e[0], e[1], e[3].index))
+            items = [(m, it) for _, _, m, it in events]
+        for m, item in items:
+            seq2.append({"modality": m, "ref": item.index, "t_start": item.t_start, "t_end": item.t_end})
     return seq2

@@ -46,6 +46,7 @@ def build_layout(
     *,
     use_audio_in_video: bool = True,
     video_block_s: Optional[float] = None,
+    within_block_order: str = "audio_first",
     interventions: Sequence[Intervention] = (),
     return_info: bool = False,
 ) -> Union[LayoutPlan, Tuple[LayoutPlan, dict[str, Any]]]:
@@ -54,6 +55,8 @@ def build_layout(
     - 不修改输入轨道（帧/块对象全部按值重建）；
     - interventions 依次应用，顺序记录进布局；
     - use_audio_in_video=False 时音频与视频按 sequential 排布；
+    - video_block_s + within_block_order 用于重述后端的按秒块交错（后端 A/B 勘察：
+      Transformers 5.23 与 mlx-vlm 0.7.12 均为 2 秒值域分块、块内视频先于音频）；
     - return_info=True 返回 (布局, 诊断)；诊断含逐侧统计与配对覆盖率，不含模型语义。
     """
     frames = [f for f in video.frames]
@@ -66,7 +69,7 @@ def build_layout(
     _validate_video(frames)
 
     mode = "interleaved" if use_audio_in_video else "sequential"
-    seq = interleave(frames, chunks, mode=mode, video_block_s=video_block_s)
+    seq = interleave(frames, chunks, mode=mode, video_block_s=video_block_s, within_block_order=within_block_order)
     pairing = compute_pairing(frames, chunks)
 
     plan = LayoutPlan(
@@ -93,7 +96,12 @@ def build_layout(
                 for c in chunks
             ],
         },
-        interleaving={"mode": mode, "video_block_s": video_block_s, "sequence": seq},
+        interleaving={
+            "mode": mode,
+            "video_block_s": video_block_s,
+            "within_block_order": within_block_order if video_block_s is not None else None,
+            "sequence": seq,
+        },
         pairing=pairing,
         interventions=applied,
         meta={"created_by": f"av_align {_VERSION}"},
