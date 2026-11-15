@@ -74,7 +74,11 @@ AV_ALIGN_OFFLINE=1 .venv/Scripts/python.exe -m pytest tests -q
 - [x] P0-01 原生/显式回放等价 + 位置干预（Colab CLI 通道，bhqc20 A100，A1–A6 全过；§4.2-2 闭环）
 - [x] G4 发布件（已验证能力范围）：CITATION.cff、许可审计（docs/license-audit.md）、干净环境安装验证 20/20（docs/release/clean-install-verification.md，发现并修复 F1/F2 元数据缺陷）、范围与限制表（docs/release/scope-limitations.md）
 - [x] 命名定稿：av_align（2026-11-15 用户决定）；RELEASE_NOTES_v0.2.0.md 与本地 tag v0.2.0 就绪，已公开：https://github.com/0G-Bhqc/av-align（tag v0.2.0 已推送）
-- [ ] P0-03 错例回放（需研究线首轮错例；开会话首个动作 = E1 同基座重存，脚本已备）
+- [x] P0-01 全前向与位置干预（Colab CLI 通道 A100 实测，A1–A6 全过，§4.2-2 闭环）
+- [x] E1 证据缺陷闭环（同基座重存，npz 独立复核位移精确性）
+- [x] P2-01 B 侧打包层实测（GitHub macOS arm64 runner + 真 MLX：不交错=实现级差异、13 token/s=代际差异）
+- [ ] P2-01 全前向/内存：按 §5 降级定稿（4bit=20.33 GiB 超 16 GiB 确认；等 ≥24 GiB 或低位宽工件）
+- [ ] P0-03 错例回放：等研究线首轮确认首个错例（开会话首个动作 = E1 同基座重存，脚本已备）
 - [ ] P2-01 后端 B Metal 执行（`av_align/adapters/mlx_adapter.py::verify_on_metal` 内置步骤）
 - [ ] P2-02 后端 C 选型冻结（docs/backend-c-candidates.md）
 - [ ] G4 发布（CITATION.cff、安装验证、复现命令）
