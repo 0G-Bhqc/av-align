@@ -15,7 +15,7 @@
 
 | 项 | 状态 | 解锁条件 |
 |---|---|---|
-| 后端 B（mlx-vlm / qwen3_omni_moe） | **16 GiB 内存超限（实测：官方最低位宽 4bit=20.33 GiB，无更低）**；两阶段 Mac 运行包已备（`artifacts/音画时间机制/p2-01-mac-运行包/`），load 失败即决策证据 | ≥24 GiB Apple Silicon 或社区低位宽工件出现；或按 §5 降级：A 单后端发布 + 附 B 勘察 |
+| 后端 B（mlx-vlm / qwen3_omni_moe） | **打包层已实测（2026-11-15，GitHub macos-latest runner，真 arm64+MLX）**：use_audio_in_video=True+独立 audio part 不交错（[V48 A78] vs L1 期望分块交错）——实现级差异登记；音频 token 率 13/s（代际差异）。**全前向/内存未验证**（4bit=20.33 GiB 超 16 GiB） | 内存项需 ≥24 GiB Apple Silicon 或低位宽工件；两阶段 Mac 运行包就绪 |
 | 后端 C（跨家族复现） | 候选清单已立、决议未冻结 | P0-03/P2-01 后按标准打分冻结（docs/backend-c-candidates.md） |
 | P0-03 错例回放 | 需研究线首个确认错例 | 研究线首轮交付错例后补同格式快照 |
 | G2 的 A/B 差异表 | 依赖 B 侧 | P2-01 |
