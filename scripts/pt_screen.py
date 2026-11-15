@@ -105,27 +105,32 @@ def main():
         try:
             path = vid_paths[vid]
             audio, _ = librosa.load(path, sr=16000, mono=True)
+            # 4.57 语义（P0-01 实测）：conversation 只放 video part，音频走 audio= kwarg；
+            # 若同时放 audio part，模板双占位符会二次消费音频迭代器 → StopIteration
             conversation = [{"role": "user", "content": [
                 {"type": "video", "video": path},
-                {"type": "audio", "audio": audio.astype("float32")},
                 {"type": "text", "text": question + " Answer with the option's letter from A, B, C directly."},
             ]}]
             text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-            kw_variants = [
-                ("direct", dict(videos=[path], audio=[audio.astype("float32")],
-                                use_audio_in_video=True, fps=2.0)),
-                ("vkw", dict(videos=[path], audio=[audio.astype("float32")],
-                             videos_kwargs={"fps": 2.0, "use_audio_in_video": True})),
-            ]
+            # token 预算：720p 帧 × fps 受 max_pixels 约束；超 30k 降 fps 重试
+            def build_inputs(fps, max_pixels):
+                kw = dict(videos=[path], audio=[audio.astype("float32")],
+                          use_audio_in_video=True, fps=fps,
+                          videos_kwargs={"fps": fps, "max_pixels": max_pixels})
+                return processor(text=[text], **kw, return_tensors="pt").to("cuda"), kw
             inputs, mode = None, None
             perrs = []
-            for name, kw in kw_variants:
+            for fps, mp in ((2.0, 768 * 28 * 28), (1.0, 448 * 448)):
                 try:
-                    inputs = processor(text=[text], **kw, return_tensors="pt").to("cuda")
-                    mode = name
+                    inputs, kw_used = build_inputs(fps, mp)
+                    n_tok = inputs["input_ids"].shape[1]
+                    if n_tok > 30000:
+                        perrs.append((f"fps={fps}", f"token 超预算 {n_tok}"))
+                        continue
+                    mode = f"fps={fps} max_pixels={mp} tokens={n_tok}"
                     break
                 except Exception as e:
-                    perrs.append((name, repr(e)[:200]))
+                    perrs.append((f"fps={fps} mp={mp}", repr(e)[:200]))
             if inputs is None:
                 rec["error"] = f"processor 失败: {perrs}"
                 items_out.append(rec)
