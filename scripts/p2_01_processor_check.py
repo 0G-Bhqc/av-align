@@ -192,8 +192,21 @@ def main() -> int:
             evidence["config_read_error"] = repr(e)[:200]
         evidence["time_constants"] = {"position_id_per_seconds": pip, "seconds_per_chunk": spc}
 
+        # 勘察修正（runner 实测）：mlx qwen3_omni processor 不接受视频路径，要 (T, C, H, W) 帧
+        import cv2
+        cap = cv2.VideoCapture(keep["container"])
+        _frames = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            _frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        video_tc = np.stack(_frames).transpose(0, 3, 1, 2)  # (T, H, W, C) -> (T, C, H, W)
+        print("解码帧:", video_tc.shape)
+
         conversation = [{"role": "user", "content": [
-            {"type": "video", "video": keep["container"]},
+            {"type": "video", "video": video_tc},
             {"type": "audio", "audio": str(pathlib.Path(keep["container"]).parent / "a.wav")},
             {"type": "text", "text": "这段媒体在哪个时刻画面与声音同时出现事件？请直接回答选项字母。"
                                      "A) 3.2 秒 B) 5.0 秒 C) 1.0 秒 D) 没有同时出现"},
