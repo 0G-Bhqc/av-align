@@ -55,6 +55,10 @@ uv pip install --python .venv/Scripts/python.exe -e ".[test]"       # L1 + 性�
 AV_ALIGN_OFFLINE=1 .venv/Scripts/python.exe -m pytest tests -q
 ```
 
+## 关于工作区引用
+
+文中部分勘察/证据链接指向本地工作区归档（`artifacts/音画时间机制/…`，Google Drive 同步目录）——**这些归档不随仓库发布**；仓库内 `docs/` 为自包含部分（schema、许可审计、发布验证、限制表、差异表）。需要证据副本请查阅 Drive 归档或联系作者。
+
 ## 仓库纪律
 
 - 仓库在本地磁盘（`D:\Develop\av_align`），不进 Google Drive 同步目录；Drive 只放文档与归档。
