@@ -131,8 +131,9 @@ def main():
             text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
             # token 预算：720p 帧 × fps 受 max_pixels 约束；超 30k 降 fps 重试
             def build_inputs(fps):
+                # 勘察（4.57.6）：顶参 fps 不生效（全帧采样 → OOM），fps 必须走 videos_kwargs
                 kw = dict(videos=[path], audio=[audio.astype("float32")],
-                          use_audio_in_video=True, fps=fps)
+                          use_audio_in_video=True, videos_kwargs={"fps": fps})
                 return processor(text=[text], **kw, return_tensors="pt").to("cuda"), kw
             inputs, mode = None, None
             perrs = []
