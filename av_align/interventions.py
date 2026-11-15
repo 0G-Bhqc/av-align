@@ -1,45 +1,25 @@
-"""干预算子：语义先在 L1 定义，后端适配器只转发不携带自己的对齐逻辑（方案 4.3）。
+"""干预算子（对齐研发方案 v2 §3.3）。
 
-四个算子，作用于时间槽而非内容：
-- ShiftBoth(dt)         共同平移：两路同加 dt，等变对照用，预期不改变绑定；
-- ReindexSide(side, m)  单路重索引：只改一路的时间起点，时长保持；主干预；
-- SwapTimeSlots(side, a, b) 换位：交换两个时间槽的归属（内容随原 index 不动），
-                          对应研究线的声音换位配对；
-- Passthrough()         原样通过：identity 干预，检查算子接入本身无副作用。
+- `passthrough()`      原样通过，等价于空干预（哈希中性）；
+- `shift_both(delta)`  两路目标区间加同一偏移（纳秒），配对保留；
+- `reindex(side, mapping)`  按稳定单元 ID 改写指定模态的目标时间，保留原区间长度；
+- `swap(side, pair)`   在两个同模态单元之间交换**内容归属**：两单元的目标时间区间互换
+                        （内容随单元 ID 移动，源时间不变，逆变换可还原）。
 
-每个算子返回 canonical 记录（进布局哈希），保证干预历史可复核。
+多项干预按声明顺序应用并逐条记录（provenance）。目标区间是唯一被改写的量；
+源时间恒保持输入值（v2：源时间与请求时间分离）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Callable, Mapping, Optional, Sequence, Union
+from typing import Callable, Mapping, Sequence, Union
 
-from .layout import AudioChunk, FrameStamp, LayoutError, _check_finite
-
-SIDE_VIDEO = "video"
-SIDE_AUDIO = "audio"
-_SIDES = (SIDE_VIDEO, SIDE_AUDIO)
-
-
-@dataclass(frozen=True)
-class ShiftBoth:
-    dt: float
-
-
-@dataclass(frozen=True)
-class ReindexSide:
-    """mapping: index -> 新 t_start（float 或 (old)->(new) 的 callable）。未覆盖的 index 报错。"""
-
-    side: str
-    mapping: Union[Mapping[int, float], Callable[[float], float]]
-
-
-@dataclass(frozen=True)
-class SwapTimeSlots:
-    side: str
-    index_a: int
-    index_b: int
+from .layout import (
+    TIME_EPS_NS,
+    LayoutError,
+    MediaUnit,
+)
 
 
 @dataclass(frozen=True)
@@ -47,79 +27,97 @@ class Passthrough:
     pass
 
 
-Intervention = Union[ShiftBoth, ReindexSide, SwapTimeSlots, Passthrough]
+@dataclass(frozen=True)
+class ShiftBoth:
+    delta_ns: int
 
 
-def _shift_frames(frames: Sequence[FrameStamp], dt: float) -> list[FrameStamp]:
-    return [replace(f, t_start=f.t_start + dt, t_end=f.t_end + dt) for f in frames]
+@dataclass(frozen=True)
+class ReindexSide:
+    """mapping: unit_id → 新目标起点（纳秒 int）；未覆盖的单元 ID 报错（v2：无效映射明确报错）。"""
+
+    side: str
+    mapping: Mapping[str, int]
 
 
-def _shift_chunks(chunks: Sequence[AudioChunk], dt: float) -> list[AudioChunk]:
-    return [replace(c, t_start=c.t_start + dt, t_end=c.t_end + dt) for c in chunks]
+@dataclass(frozen=True)
+class SwapUnits:
+    """v2 `swap(side, pair)`：交换两单元的目标区间（内容归属随之互换）。"""
+
+    side: str
+    unit_id_a: str
+    unit_id_b: str
 
 
-def _side_list(side: str, frames: list[FrameStamp], chunks: list[AudioChunk]):
-    if side == SIDE_VIDEO:
-        return frames
-    if side == SIDE_AUDIO:
-        return chunks
+Intervention = Union[Passthrough, ShiftBoth, ReindexSide, SwapUnits]
+
+_SIDES = ("video", "audio")
+
+
+def _side_units(side: str, video: list[MediaUnit], audio: list[MediaUnit]) -> list[MediaUnit]:
+    if side == "video":
+        return video
+    if side == "audio":
+        return audio
     raise LayoutError(f"未知模态: {side!r}（应为 'video' 或 'audio'）")
 
 
-def _reindex(items, mapping):
-    out: list = []
-    for it in items:
-        old_start = it.t_start
-        if callable(mapping):
-            new_start = float(mapping(old_start))
-        else:
-            if it.index not in mapping:
-                raise LayoutError(f"重索引 mapping 未覆盖 index={it.index!r}；必须全覆盖，不静默保留")
-            new_start = float(mapping[it.index])
-        _check_finite("reindex new_start", new_start)
-        dur = it.t_end - it.t_start
-        out.append(replace(it, t_start=new_start, t_end=new_start + dur))
-    return out
-
-
 def apply_intervention(
-    op: Intervention, frames: list[FrameStamp], chunks: list[AudioChunk]
-) -> tuple[list[FrameStamp], list[AudioChunk], dict]:
-    """应用单个干预，返回新列表（不改输入）与 canonical 干预记录。"""
+    op: Intervention, video: list[MediaUnit], audio: list[MediaUnit]
+) -> tuple[list[MediaUnit], list[MediaUnit], dict]:
+    """应用单个干预到**目标区间**，返回新列表（不改输入）与 canonical 干预记录。"""
     if isinstance(op, Passthrough):
-        return frames, chunks, {"op": "passthrough", "params": {}}
+        return video, audio, {"op": "passthrough", "params": {}}
     if isinstance(op, ShiftBoth):
-        _check_finite("ShiftBoth.dt", op.dt)
+        if not isinstance(op.delta_ns, int) or isinstance(op.delta_ns, bool):
+            raise LayoutError(f"shift_both 偏移必须是整数纳秒: {op.delta_ns!r}")
         return (
-            _shift_frames(frames, op.dt),
-            _shift_chunks(chunks, op.dt),
-            {"op": "shift_both", "params": {"dt": op.dt}},
+            [replace(u, t_start=u.t_start + op.delta_ns, t_end=u.t_end + op.delta_ns) for u in video],
+            [replace(u, t_start=u.t_start + op.delta_ns, t_end=u.t_end + op.delta_ns) for u in audio],
+            {"op": "shift_both", "params": {"delta_ns": op.delta_ns}},
         )
     if isinstance(op, ReindexSide):
-        items = _side_list(op.side, frames, chunks)
-        new_items = _reindex(items, op.mapping)
-        if op.side == SIDE_VIDEO:
-            return new_items, chunks, {"op": "reindex", "params": {"side": op.side}}
-        return frames, new_items, {"op": "reindex", "params": {"side": op.side}}
-    if isinstance(op, SwapTimeSlots):
-        items = _side_list(op.side, frames, chunks)
-        by_index = {it.index: it for it in items}
-        for i in (op.index_a, op.index_b):
-            if i not in by_index:
-                raise LayoutError(f"换位 index 不存在: {i!r}")
-        a, b = by_index[op.index_a], by_index[op.index_b]
-        span_a, span_b = (a.t_start, a.t_end), (b.t_start, b.t_end)
-        swapped_a = replace(a, t_start=span_b[0], t_end=span_b[1])
-        swapped_b = replace(b, t_start=span_a[0], t_end=span_a[1])
-        if op.side == SIDE_VIDEO:
-            new_frames = [swapped_a if f.index == op.index_a else swapped_b if f.index == op.index_b else f for f in frames]
-            return new_frames, chunks, {
-                "op": "swap_time_slots",
-                "params": {"side": op.side, "index_a": op.index_a, "index_b": op.index_b},
-            }
-        new_chunks = [swapped_a if c.index == op.index_a else swapped_b if c.index == op.index_b else c for c in chunks]
-        return frames, new_chunks, {
-            "op": "swap_time_slots",
-            "params": {"side": op.side, "index_a": op.index_a, "index_b": op.index_b},
-        }
+        if op.side not in _SIDES:
+            raise LayoutError(f"未知模态: {op.side!r}")
+        units = _side_units(op.side, video, audio)
+        ids = {u.unit_id for u in units}
+        missing = set(op.mapping) - ids
+        if missing:
+            raise LayoutError(f"reindex mapping 引用不存在的单元 ID: {sorted(missing)!r}；必须全部有效")
+        if callable(op.mapping):
+            raise LayoutError("reindex mapping 必须是 unit_id → 纳秒 的显式映射（v2：无效映射明确报错）")
+        remapped: dict[str, int] = {}
+        for uid, new_start in op.mapping.items():
+            if not isinstance(new_start, int) or isinstance(new_start, bool):
+                raise LayoutError(f"reindex 目标起点必须是整数纳秒: {uid!r} → {new_start!r}")
+            remapped[uid] = new_start
+        new_units = []
+        for u in units:
+            if u.unit_id in remapped:
+                dur = u.t_end - u.t_start
+                new_units.append(replace(u, t_start=remapped[u.unit_id], t_end=remapped[u.unit_id] + dur))
+            else:
+                new_units.append(u)
+        if op.side == "video":
+            return new_units, audio, {"op": "reindex", "params": {"side": op.side, "unit_ids": sorted(remapped)}}
+        return video, new_units, {"op": "reindex", "params": {"side": op.side, "unit_ids": sorted(remapped)}}
+    if isinstance(op, SwapUnits):
+        if op.side not in _SIDES:
+            raise LayoutError(f"未知模态: {op.side!r}")
+        units = _side_units(op.side, video, audio)
+        by_id = {u.unit_id: u for u in units}
+        for uid in (op.unit_id_a, op.unit_id_b):
+            if uid not in by_id:
+                raise LayoutError(f"swap 单元不存在: {uid!r}")
+        a, b = by_id[op.unit_id_a], by_id[op.unit_id_b]
+        swapped_a = replace(a, t_start=b.t_start, t_end=b.t_end)
+        swapped_b = replace(b, t_start=a.t_start, t_end=a.t_end)
+        new_units = [
+            swapped_a if u.unit_id == op.unit_id_a else swapped_b if u.unit_id == op.unit_id_b else u
+            for u in units
+        ]
+        record = {"op": "swap", "params": {"side": op.side, "pair": [op.unit_id_a, op.unit_id_b]}}
+        if op.side == "video":
+            return new_units, audio, record
+        return video, new_units, record
     raise LayoutError(f"未知干预算子: {op!r}")

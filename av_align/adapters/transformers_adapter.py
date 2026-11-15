@@ -161,6 +161,90 @@ def compare_media_runs(backend_runs: list[dict], expected_runs: list[dict]) -> d
     return {"matched": not diffs, "diffs": diffs, "backend_runs": backend_runs, "expected_runs": expected_runs}
 
 
+SNAPSHOT_SCHEMA = "av_align.backend_snapshot/0-draft"  # v2 §3.2 后端快照（schema 待 G2 冻结）
+
+
+def build_backend_snapshot(
+    *,
+    backend_version: str,
+    model_id: str,
+    grid_t: int,
+    tokens_per_frame: int,
+    n_audio_tokens: int,
+    fps: float,
+    video_unit_ids: list[str],
+    audio_unit_ids: list[str],
+    special_ids: dict[str, int],
+    position_id_per_seconds: float = TIME_DEFAULTS["position_id_per_seconds"],
+    seconds_per_chunk: float = TIME_DEFAULTS["seconds_per_chunk"],
+    temporal_patch_size: float = TIME_DEFAULTS["temporal_patch_size"],
+) -> dict[str, Any]:
+    """构造 v2 §3.2 的后端快照记录（A 侧，packaging 层；前向入参快照待 P0-03/G2）。
+
+    unit→token 映射与位置值由已验证的打包规则推导（tests 内双级核验支撑）：
+    - 视频：第 k 个视频运行覆盖连续 patch；patch p → tokens_per_frame 个 token，
+      位置值 = int(p × tps/fps × pip)（.long() 截断，显式记录）；
+    - 音频：chunk k → 全局音频 token 下标 k，位置稠密（逐 run 连续 +1，段间偏移由
+      rope 核验记录，不在本函数断言）。
+    """
+    step = temporal_patch_size / float(fps) * position_id_per_seconds
+    window = int(position_id_per_seconds * seconds_per_chunk)
+    video_values = [int(p * step) for p in range(grid_t)]
+    n_windows = max(
+        (video_values[-1] // window + 1) if video_values else 0,
+        (n_audio_tokens + window - 1) // window if n_audio_tokens else 0,
+    )
+    runs: list[dict[str, Any]] = []
+    token_idx = 0
+    patch_cursor = 0
+    video_unit_token_map: dict[str, dict[str, Any]] = {}
+    for j in range(n_windows):
+        n_patches = sum(1 for v in video_values if j * window <= v < (j + 1) * window)
+        if n_patches:
+            runs.append({"modality": "video", "n_tokens": n_patches * tokens_per_frame, "window": j})
+            for i in range(n_patches):
+                p = patch_cursor + i
+                uid = video_unit_ids[p]
+                video_unit_token_map[uid] = {
+                    "token_range": [token_idx + i * tokens_per_frame, token_idx + (i + 1) * tokens_per_frame],
+                    "position_value": video_values[p],
+                    "truncation": "int(p*step) 截断，step = tps/fps*pip = %s" % step,
+                }
+            token_idx += n_patches * tokens_per_frame
+            patch_cursor += n_patches
+        na_lo = min(n_audio_tokens, j * window)
+        na_hi = min(n_audio_tokens, (j + 1) * window)
+        if na_hi > na_lo:
+            runs.append({"modality": "audio", "n_tokens": na_hi - na_lo, "window": j})
+            token_idx += na_hi - na_lo
+
+    audio_unit_token_map = {
+        uid: {"token_index": k, "position_rule": "dense arange（段间偏移见 rope 核验）"}
+        for k, uid in enumerate(audio_unit_ids)
+    }
+    return {
+        "snapshot_schema": SNAPSHOT_SCHEMA,
+        "backend": f"transformers=={backend_version}",
+        "model_id": model_id,
+        "weights_sha": None,  # 待 P0-03/G2 固定权重后填（v2 复现标识要求）
+        "time_constants": {
+            "position_id_per_seconds": position_id_per_seconds,
+            "seconds_per_chunk": seconds_per_chunk,
+            "temporal_patch_size": temporal_patch_size,
+            "audio_token_ms": TIME_DEFAULTS["audio_token_ms"],
+            "tokens_per_chunk": int(position_id_per_seconds * seconds_per_chunk),
+        },
+        "special_token_ids": special_ids,
+        "media_runs": runs,
+        "unit_token_map": {"video": video_unit_token_map, "audio": audio_unit_token_map},
+        "unverified_fields": [
+            "weights_sha（权重未加载）",
+            "前向入参快照（input_ids/掩码/媒体张量指纹/选项 logits，待 G2 原生回放）",
+            "音频段间位置偏移的绝对值（rope 核验为差分口径）",
+        ],
+    }
+
+
 def tiny_thinker(device: str = "cpu"):
     """tiny-config 实例化 thinker 基类：仅调用 get_rope_index（与权重无关，随机初始化即可）。"""
     import torch

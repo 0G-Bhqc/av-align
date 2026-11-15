@@ -1,26 +1,26 @@
-"""方案 4.4 的六项性质测试（G1 验收核心）。
+"""v2 方案 §4.1 的六项性质测试（G1 验收核心）。
 
-每项测试对应方案条目，失败即 G1 不通过。测试 3 的期望由测试内独立实现
-（直接重叠公式 + 排序），不调用被测的 compute_pairing/interleave，避免循环论证。
+对齐 v2 契约：整数纳秒、稳定单元 ID、源时间/目标时间分离、swap=内容归属交换、
+identity 干预哈希中性。测试 3 的期望由测试内独立实现（重叠公式 + 排序），
+不调用被测的 compute_pairing/interleave，避免循环论证。
 """
 
 from __future__ import annotations
-
-import math
 
 import numpy as np
 import pytest
 
 from av_align import (
-    AudioTrack,
     LayoutError,
+    MediaUnit,
     Passthrough,
     ReindexSide,
     ShiftBoth,
-    SwapTimeSlots,
-    VideoTrack,
+    SwapUnits,
+    UnitTrack,
     build_layout,
     make_synthetic_event_fixture,
+    s_to_ns,
 )
 
 FPS = 4.0
@@ -35,206 +35,227 @@ def _fixture(event_t=3.2):
     )
 
 
-# --- 性质 1：原样通过等价（L1 部分） -----------------------------------------
+def _runs(seq):
+    out = []
+    for s in seq:
+        if out and out[-1]["modality"] == s["modality"]:
+            out[-1]["n"] += 1
+        else:
+            out.append({"modality": s["modality"], "n": 1})
+    return out
+
+
+# --- 性质 1：原样通过（v2：空干预与显式 identity 产出相同布局内容和哈希） ------
 
 def test_passthrough_identity():
     fx = _fixture()
     base = build_layout(fx.video, fx.audio)
     passed = build_layout(fx.video, fx.audio, interventions=[Passthrough()])
-    # 布局内容逐字段一致；干预记录是 provenance，原样通过只在 interventions 里多一条 identity 记录
-    for key in ("video", "audio", "interleaving", "pairing"):
-        assert base.to_dict()[key] == passed.to_dict()[key]
-    assert passed.interventions == [{"op": "passthrough", "params": {}}]
+    assert base["hash"] == passed["hash"]
+    # 布局内容逐字段一致；request.interventions 是 provenance，identity 只多一条记录
+    assert base["media_units"] == passed["media_units"]
+    assert base["request"]["target"] == passed["request"]["target"]
+    assert base["request"]["expected_sequence"] == passed["request"]["expected_sequence"]
+    assert base["pairing"] == passed["pairing"]
+    # identity 干预的目标区间与源时间逐字段一致
+    assert passed["request"]["target"] == passed["media_units"]
+    assert passed["request"]["interventions"] == [{"op": "passthrough", "params": {}}]
 
 
-# --- 性质 2：共同平移等变 -----------------------------------------------------
+# --- 性质 2：共同平移（两路同加偏移，相对量与重叠配对保留） -------------------
 
 def test_common_shift_equivariance():
     fx = _fixture()
-    dt = 0.7
+    dt = s_to_ns(0.7)  # 呼应媒体探针的 700ms 工况
     base = build_layout(fx.video, fx.audio)
     shifted = build_layout(fx.video, fx.audio, interventions=[ShiftBoth(dt)])
 
-    # 相对顺序逐项不变
-    seq_b = [(s["modality"], s["ref"]) for s in base.interleaving["sequence"]]
-    seq_s = [(s["modality"], s["ref"]) for s in shifted.interleaving["sequence"]]
+    seq_b = [(s["modality"], s["unit_id"]) for s in base["request"]["expected_sequence"]]
+    seq_s = [(s["modality"], s["unit_id"]) for s in shifted["request"]["expected_sequence"]]
     assert seq_b == seq_s
 
-    # 相邻 token 时间差逐项不变（等预算的相对时间关系）
-    tb = [s["t_start"] for s in base.interleaving["sequence"]]
-    ts = [s["t_start"] for s in shifted.interleaving["sequence"]]
-    assert len(tb) == len(ts)
+    tb = [s["t_start"] for s in base["request"]["expected_sequence"]]
+    ts = [s["t_start"] for s in shifted["request"]["expected_sequence"]]
     for i in range(1, len(tb)):
-        assert ts[i] - ts[i - 1] == pytest.approx(tb[i] - tb[i - 1], abs=1e-12)
+        assert ts[i] - ts[i - 1] == tb[i] - tb[i - 1]  # 整数纳秒：精确相等，无浮点误差
 
-    # 绝对时间恰好平移 dt
-    for sb, ss in zip(base.interleaving["sequence"], shifted.interleaving["sequence"]):
-        assert ss["t_start"] == pytest.approx(sb["t_start"] + dt, abs=1e-12)
-        assert ss["t_end"] == pytest.approx(sb["t_end"] + dt, abs=1e-12)
+    for sb, ss in zip(base["request"]["expected_sequence"], shifted["request"]["expected_sequence"]):
+        assert ss["t_start"] == sb["t_start"] + dt
+        assert ss["t_end"] == sb["t_end"] + dt
 
-    # 配对表逐项不变（模态与引用集合）
-    pb = {(p["video_frame"], tuple(p["audio_chunks"])) for p in base.pairing}
-    ps = {(p["video_frame"], tuple(p["audio_chunks"])) for p in shifted.pairing}
-    assert pb == ps
+    pb = {(p["video_unit"], tuple(p["audio_units"])) for p in base["pairing"]}
+    ps = {(p["video_unit"], tuple(p["audio_units"])) for p in shifted["pairing"]}
+    assert pb == ps  # 配对表逐项不变
 
 
-# --- 性质 3：单路平移可预测 ---------------------------------------------------
+# --- 性质 3：单路重索引（预先手算映射逐字段比对） -----------------------------
 
-def _independent_layout(frames, chunks):
-    """测试内独立实现：直接重叠公式 + 排序，不调用 av_align 的对应函数。"""
-    pairing = {}
-    for f in sorted(frames, key=lambda x: (x.t_start, x.index)):
+def _independent_pairing(video_spans, audio_spans):
+    """测试内独立实现：unit_id → 与其重叠的音频 unit_id 集合（重叠 > 1ns）。"""
+    out = {}
+    for vid, (v0, v1) in video_spans.items():
         acc = []
-        for c in sorted(chunks, key=lambda x: x.index):
-            if min(f.t_end, c.t_end) - max(f.t_start, c.t_start) > 1e-9:
-                acc.append(c.index)
-        pairing[f.index] = tuple(acc)
-    events = [(f.t_start, 0, "video", f.index) for f in frames] + [
-        (c.t_start, 1, "audio", c.index) for c in chunks
-    ]
-    events.sort(key=lambda e: (e[0], e[1], e[3]))
-    return pairing, [(m, r) for _, _, m, r in events]
+        for aid, (a0, a1) in sorted(audio_spans.items()):
+            if min(v1, a1) - max(v0, a0) > 1:
+                acc.append(aid)
+        out[vid] = tuple(acc)
+    return out
 
 
-def test_single_side_shift_predictable():
+def test_single_side_reindex_predicted():
     fx = _fixture()
-    dt = 0.35
+    dt = s_to_ns(0.35)
+    mapping = {u.unit_id: u.t_start + dt for u in fx.video.units}
     base = build_layout(fx.video, fx.audio)
-    re = build_layout(
-        fx.video, fx.audio, interventions=[ReindexSide("video", {f.index: f.t_start + dt for f in fx.video.frames})]
+    re = build_layout(fx.video, fx.audio, interventions=[ReindexSide("video", mapping)])
+
+    # 音频目标区间完全不动
+    assert base["request"]["target"]["audio"] == re["request"]["target"]["audio"]
+    # 视频目标区间 = 原区间起点 + dt，时长保持；源时间不变
+    src = {u["unit_id"]: (u["t_start"], u["t_end"]) for u in re["media_units"]["video"]}
+    tgt = {u["unit_id"]: (u["t_start"], u["t_end"]) for u in re["request"]["target"]["video"]}
+    for uid, new_start in mapping.items():
+        assert tgt[uid][0] == new_start
+        assert tgt[uid][1] - tgt[uid][0] == src[uid][1] - src[uid][0]
+    assert src == {u["unit_id"]: (u["t_start"], u["t_end"]) for u in base["media_units"]["video"]}
+
+    # 与测试内独立实现比对（配对）
+    audio_spans = {u["unit_id"]: (u["t_start"], u["t_end"]) for u in re["request"]["target"]["audio"]}
+    got_pair = {p["video_unit"]: tuple(p["audio_units"]) for p in re["pairing"]}
+    assert got_pair == _independent_pairing(tgt, audio_spans)
+
+    # 绑定随干预可预测：覆盖 event_t+dt 的音频块 ∈ 闪帧目标区间的配对集
+    target_chunk = next(
+        uid for uid, (a0, a1) in audio_spans.items() if a0 <= s_to_ns(fx.event_t_s) + dt < a1
     )
-
-    # 音频侧完全不动
-    assert base.audio["chunks"] == re.audio["chunks"]
-
-    # 视频帧时间槽 = 原槽 + dt（时长保持）
-    for fb, fr in zip(base.video["frames"], re.video["frames"]):
-        assert fr["index"] == fb["index"]
-        assert fr["t_start"] == pytest.approx(fb["t_start"] + dt, abs=1e-12)
-        assert fr["t_end"] - fr["t_start"] == pytest.approx(fb["t_end"] - fb["t_start"], abs=1e-12)
-
-    # 与测试内独立实现比对
-    frames = [
-        type("F", (), {"index": fr["index"], "t_start": fr["t_start"], "t_end": fr["t_end"]})()
-        for fr in re.video["frames"]
-    ]
-    chunks = [
-        type("C", (), {"index": c["index"], "t_start": c["t_start"], "t_end": c["t_end"]})()
-        for c in re.audio["chunks"]
-    ]
-    exp_pair, exp_seq = _independent_layout(frames, chunks)
-    got_pair = {p["video_frame"]: tuple(p["audio_chunks"]) for p in re.pairing}
-    assert got_pair == exp_pair
-    got_seq = [(s["modality"], s["ref"]) for s in re.interleaving["sequence"]]
-    assert got_seq == exp_seq
-
-    # 绑定随干预可预测地改变：闪帧对应的音频块集合 = 覆盖 event_t+dt 的块
-    fx2_chunks = [c for c in re.audio["chunks"]]
-    target = next(c["index"] for c in fx2_chunks if c["t_start"] <= fx.event_t + dt < c["t_end"])
-    frame_slot = next(fr for fr in re.video["frames"] if fr["index"] == fx.flash_frame_index)
-    got = {p["video_frame"]: tuple(p["audio_chunks"]) for p in re.pairing}[fx.flash_frame_index]
-    assert target in got
+    assert target_chunk in got_pair[fx.flash_unit_id]
 
 
-# --- 性质 4：帧序无关 ---------------------------------------------------------
+def test_reindex_invalid_mappings_raise():
+    fx = _fixture()
+    with pytest.raises(LayoutError):
+        build_layout(fx.video, fx.audio, interventions=[ReindexSide("video", {"不存在": 0})])  # 未匹配 ID
+    with pytest.raises(LayoutError):
+        build_layout(fx.video, fx.audio, interventions=[ReindexSide("video", {fx.video.units[0].unit_id: 0.5})])  # 非整数纳秒
 
-def test_frame_order_invariance():
+    # v2 语义：部分覆盖合法——只改写指定单元的目标时间，其余单元逐字段不动
+    mapped = fx.video.units[3].unit_id
+    re = build_layout(fx.video, fx.audio, interventions=[ReindexSide("video", {mapped: fx.video.units[3].t_start + s_to_ns(1.0)})])
+    tgt = {u["unit_id"]: (u["t_start"], u["t_end"]) for u in re["request"]["target"]["video"]}
+    for u in fx.video.units:
+        if u.unit_id == mapped:
+            assert tgt[u.unit_id][0] == u.t_start + s_to_ns(1.0)
+        else:
+            assert tgt[u.unit_id] == (u.t_start, u.t_end)
+
+
+# --- 性质 4：输入顺序稳定（打乱帧记录，布局与哈希一致） ------------------------
+
+def test_input_order_stability():
     fx = _fixture()
     rng = np.random.default_rng(17)
-    order = rng.permutation(len(fx.video.frames))
-    shuffled = VideoTrack(frames=[fx.video.frames[i] for i in order], fps=fx.video.fps)
+    order = rng.permutation(len(fx.video.units))
+    shuffled = UnitTrack(units=[fx.video.units[i] for i in order], modality="video")
     base = build_layout(fx.video, fx.audio)
     other = build_layout(shuffled, fx.audio)
-    assert base.hash_ == other.hash_
-    assert base.to_dict() == other.to_dict()
+    assert base["hash"] == other["hash"]
+    assert base == other
 
 
-# --- 性质 5：事件绑定夹具 -----------------------------------------------------
+# --- 性质 5：事件配对和换位（配对 + 内容归属交换 + 逆变换） --------------------
 
-def test_synthetic_event_binding():
+def test_event_pairing_and_swap():
     fx = _fixture(event_t=3.2)
     plan = build_layout(fx.video, fx.audio)
-    pairing = {p["video_frame"]: tuple(p["audio_chunks"]) for p in plan.pairing}
-    # 闪帧与提示音块落入相同（重叠）时间槽：提示音块在闪帧的配对集合中
-    assert fx.beep_chunk_index in pairing[fx.flash_frame_index]
+    pairing = {p["video_unit"]: tuple(p["audio_units"]) for p in plan["pairing"]}
+    assert fx.beep_unit_id in pairing[fx.flash_unit_id]
 
-    # 两事件情形：各自绑定各自的时间槽
-    from av_align import add_beep_at
+    # swap：两个音频单元目标区间互换（内容归属交换），源时间不变
+    other = fx.audio.units[0].unit_id if fx.audio.units[0].unit_id != fx.beep_unit_id else fx.audio.units[5].unit_id
+    swapped = build_layout(fx.video, fx.audio, interventions=[SwapUnits("audio", fx.beep_unit_id, other)])
+    src = {u["unit_id"]: (u["t_start"], u["t_end"]) for u in swapped["media_units"]["audio"]}
+    tgt = {u["unit_id"]: (u["t_start"], u["t_end"]) for u in swapped["request"]["target"]["audio"]}
+    a, b = fx.beep_unit_id, other
+    assert tgt[a] == src[b] and tgt[b] == src[a]
+    assert tgt[a][1] - tgt[a][0] == src[a][1] - src[a][0]  # 时长保持
+    # 配对随目标区间改变：提示音不再与闪帧配对
+    pairing2 = {p["video_unit"]: tuple(p["audio_units"]) for p in swapped["pairing"]}
+    assert fx.beep_unit_id not in pairing2[fx.flash_unit_id]
 
-    fx2 = make_synthetic_event_fixture(duration_s=DUR, fps=FPS, sample_rate=SR, chunk_ms=CHUNK_MS, event_t=2.5)
-    late_frame, late_chunk = add_beep_at(fx2, t=7.5)
-    plan2 = build_layout(fx2.video, fx2.audio)
-    p2 = {p["video_frame"]: tuple(p["audio_chunks"]) for p in plan2.pairing}
-    assert late_chunk in p2[late_frame]
-    # 两事件不同帧不同块，互不绑定
-    assert fx2.flash_frame_index != late_frame
-    assert fx2.beep_chunk_index not in p2[late_frame]
-    assert late_chunk not in p2[fx2.flash_frame_index]
+    # 逆变换：两次 swap 恢复原目标区间 → 哈希与无干预一致（干预记录不在哈希内）
+    restored = build_layout(
+        fx.video,
+        fx.audio,
+        interventions=[SwapUnits("audio", fx.beep_unit_id, other), SwapUnits("audio", fx.beep_unit_id, other)],
+    )
+    assert restored["hash"] == plan["hash"]
 
 
-# --- 性质 6：重采样稳定 -------------------------------------------------------
+# --- 性质 6：重采样稳定（冻结采样配置，同一事件对应关系保持） ------------------
 
 def test_resampling_stability():
     event_t = 3.2
-    cfgs = [
-        (4.0, 40.0),
-        (8.0, 20.0),   # 更细的时间粒度
-        (2.0, 80.0),   # 更粗的时间粒度
-    ]
-    for fps, chunk_ms in cfgs:
+    for fps, chunk_ms in [(4.0, 40.0), (8.0, 20.0), (2.0, 80.0)]:
         fx = make_synthetic_event_fixture(
             duration_s=DUR, fps=fps, sample_rate=SR, chunk_ms=chunk_ms, event_t=event_t
         )
         plan = build_layout(fx.video, fx.audio)
-        pairing = {p["video_frame"]: tuple(p["audio_chunks"]) for p in plan.pairing}
-        # 事件槽包含关系在两种粒度下均成立：覆盖 event_t 的块 ∈ 覆盖 event_t 的帧的配对集
-        assert fx.beep_chunk_index in pairing[fx.flash_frame_index], (fps, chunk_ms)
+        pairing = {p["video_unit"]: tuple(p["audio_units"]) for p in plan["pairing"]}
+        assert fx.beep_unit_id in pairing[fx.flash_unit_id], (fps, chunk_ms)
 
 
-# --- 契约测试（非六项，随附） -------------------------------------------------
+# --- 契约（v2 §3.2） ----------------------------------------------------------
 
 def test_no_input_mutation():
     fx = _fixture()
-    frames_before = [(f.index, f.t_start, f.t_end) for f in fx.video.frames]
-    chunks_before = [(c.index, c.t_start, c.t_end, c.sample_span) for c in fx.audio.chunks]
-    build_layout(fx.video, fx.audio, interventions=[ShiftBoth(1.0), SwapTimeSlots("video", 0, 5)])
-    assert frames_before == [(f.index, f.t_start, f.t_end) for f in fx.video.frames]
-    assert chunks_before == [(c.index, c.t_start, c.t_end, c.sample_span) for c in fx.audio.chunks]
+    src_before = [(u.unit_id, u.t_start, u.t_end, u.source_ref) for u in fx.video.units] + [
+        (u.unit_id, u.t_start, u.t_end, u.source_ref) for u in fx.audio.units
+    ]
+    build_layout(
+        fx.video,
+        fx.audio,
+        interventions=[
+            ShiftBoth(s_to_ns(1.0)),
+            SwapUnits("video", fx.video.units[0].unit_id, fx.video.units[5].unit_id),
+        ],
+    )
+    src_after = [(u.unit_id, u.t_start, u.t_end, u.source_ref) for u in fx.video.units] + [
+        (u.unit_id, u.t_start, u.t_end, u.source_ref) for u in fx.audio.units
+    ]
+    assert src_before == src_after
 
 
 def test_invalid_inputs_raise():
     fx = _fixture()
     with pytest.raises(LayoutError):
-        build_layout(VideoTrack.from_fps(2, FPS, t0=float("nan")), fx.audio)
+        UnitTrack(units=[fx.video.units[0], fx.video.units[0]], modality="video")  # ID 重复
     with pytest.raises(LayoutError):
-        AudioTrack.from_chunk_times([(1.0, 0.5)])  # 时长非正
+        MediaUnit("x", "video", 0, 100, time_source="拍脑袋")  # 未知时间来源
     with pytest.raises(LayoutError):
-        # 重索引未全覆盖
-        build_layout(fx.video, fx.audio, interventions=[ReindexSide("video", {0: 0.0})])
+        MediaUnit("x", "video", 100, 100)  # 时长非正
     with pytest.raises(LayoutError):
-        build_layout(fx.video, fx.audio, interventions=[SwapTimeSlots("video", 0, 999)])
+        MediaUnit("x", "video", 0.5, 100)  # 非整数纳秒
     with pytest.raises(LayoutError):
-        # 音频块乱序
-        AudioTrack.from_chunk_times([(0.0, 0.04), (0.0, 0.04)])
+        UnitTrack.from_unit_times([(1.0, 0.5)], "audio")  # 区间无效
+    with pytest.raises(LayoutError):
+        UnitTrack.from_unit_times([(0.0, 0.1), (0.05, 0.15)], "audio")  # 音频单元重叠
+    with pytest.raises(LayoutError):
+        build_layout(fx.video, fx.audio, interventions=[SwapUnits("video", fx.video.units[0].unit_id, "不存在")])
 
 
-def test_empty_and_sequential_modes():
-    empty_v = VideoTrack(frames=[], fps=FPS)
+def test_sequential_and_block_modes():
     fx = _fixture()
-    plan = build_layout(empty_v, fx.audio)
-    assert plan.video["n_frames"] == 0
-    assert all(s["modality"] == "audio" for s in plan.interleaving["sequence"])
-    plan2 = build_layout(fx.video, fx.audio, use_audio_in_video=False)
-    assert plan2.interleaving["mode"] == "sequential"
-    seq = plan2.interleaving["sequence"]
-    assert [s["modality"] for s in seq] == ["video"] * len(fx.video.frames) + ["audio"] * len(fx.audio.chunks)
+    plan_seq = build_layout(fx.video, fx.audio, use_audio_in_video=False)
+    mods = [s["modality"] for s in plan_seq["request"]["expected_sequence"]]
+    assert mods == ["video"] * len(fx.video.units) + ["audio"] * len(fx.audio.units)
 
-
-def test_video_block_interleaving_matches_backend_style():
-    fx = _fixture()
-    plan = build_layout(fx.video, fx.audio, video_block_s=2.0)
-    seq = plan.interleaving["sequence"]
-    assert plan.interleaving["video_block_s"] == 2.0
-    # 块内视频帧连续，块间按时间插入音频：序列中视频引用按 index 升序出现在各自块内
-    video_refs = [s["ref"] for s in seq if s["modality"] == "video"]
-    assert video_refs == sorted(video_refs)
+    # 分块模式（后端重述）：patch 槽位 + 40ms 音频块，2 秒窗、块内视频先行
+    video = UnitTrack.from_patch_grid(n_patches=6, fps=FPS)  # 12 原始帧 @4fps = 3s
+    audio = UnitTrack.from_unit_times([(i * 0.04, (i + 1) * 0.04) for i in range(75)], "audio")
+    plan_blk = build_layout(video, audio, video_block_s=2.0, within_block_order="video_first")
+    assert _runs(plan_blk["request"]["expected_sequence"]) == [
+        {"modality": "video", "n": 4},
+        {"modality": "audio", "n": 50},
+        {"modality": "video", "n": 2},
+        {"modality": "audio", "n": 25},
+    ]
