@@ -110,7 +110,11 @@ def main():
     thinker.eval()
 
     # 远端 zip 抽取需要的视频
-    import remotezip
+    try:
+        import remotezip
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "remotezip"], check=True)
+        import remotezip
     work = "/content/pt_media"
     os.makedirs(work, exist_ok=True)
     with remotezip.RemoteZip(ZIP_URL) as z:
