@@ -35,11 +35,13 @@ ITEMS = [
     ("video_6260", 1, "How many times did the person launch the object on the slanted plane?", ["4", "6", "3"], 1),
     ("video_9491", 1, "How many times did the person launch objects on the table?", ["7", "3", "2"], 2),
 ]
+ITEMS = ITEMS[: int(os.environ.get("ITEMS_LIMIT", str(len(ITEMS))))]
 NEEDED = sorted({i[0] for i in ITEMS})
 
 
 def gt_letter(options, answer_id):
-    return options[answer_id].strip()[0].upper()
+    # 正确选项的位次字母（数值选项的文本首字符是数字，不是字母——0.1 版实测 bug）
+    return chr(ord("A") + int(answer_id))
 
 
 def parse_answer(text, options):
@@ -53,6 +55,13 @@ def parse_answer(text, options):
         letter = chr(ord("A") + i)
         if opt.lower()[:20] in t.lower():
             return letter, t
+    # 数字选项：模型回答中出现的独立数字
+    import re as _re
+    m = _re.search(r"\b(\d+)\b", t)
+    if m:
+        for i, opt in enumerate(options):
+            if opt.strip() == m.group(1):
+                return chr(ord("A") + i), t
     return None, t
 
 
@@ -117,8 +126,24 @@ def main():
         assert hits, f"视频缺失: {v}"
         vid_paths[v] = hits[0]
     print("视频就绪:", vid_paths)
+    if os.environ.get("PHASE", "run") == "setup":
+        # setup 阶段：模型与视频留在内核 globals（exec 间持久），返回以避开 CLI 连接墙
+        print("PHASE=setup 完成——内核已持模型/processor/视频；下一步跑 PHASE=run")
+        return 0
 
+    import gc
+    gc.collect(); torch.cuda.empty_cache()
+    ns = get_ipython().user_ns
+    ns.setdefault("pt_items_done", {})
+    evidence_path = OUT / "report.json"  # 提前定义：逐题 checkpoint 用
+
+    done_map = ns.get("pt_items_done", {})
     for vid, qid, question, options, answer_id in ITEMS:
+        prev = done_map.get((vid, qid))
+        if prev and (prev.get("correct") is not None or prev.get("model_raw")):
+            print("跳过已完成:", vid, qid)
+            items_out.append(prev)
+            continue
         rec = {"video": vid, "qid": qid, "question": question,
                "options": options, "gt_letter": gt_letter(options, answer_id)}
         try:
@@ -185,6 +210,10 @@ def main():
         except Exception as e:
             rec["error"] = f"{type(e).__name__}: {repr(e)[:300]}"
         items_out.append(rec)
+        ns["pt_items_done"][(vid, qid)] = rec
+        ev["items"] = list(ns["pt_items_done"].values())
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        evidence_path.write_text(json.dumps(ev, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(rec, ensure_ascii=False)[:220])
 
     n_judged = sum(1 for r in items_out if r.get("correct") is not None)
