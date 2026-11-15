@@ -125,24 +125,23 @@ def main():
             ]}]
             text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
             # token 预算：720p 帧 × fps 受 max_pixels 约束；超 30k 降 fps 重试
-            def build_inputs(fps, max_pixels):
+            def build_inputs(fps):
                 kw = dict(videos=[path], audio=[audio.astype("float32")],
-                          use_audio_in_video=True, fps=fps,
-                          videos_kwargs={"fps": fps, "max_pixels": max_pixels})
+                          use_audio_in_video=True, fps=fps)
                 return processor(text=[text], **kw, return_tensors="pt").to("cuda"), kw
             inputs, mode = None, None
             perrs = []
-            for fps, mp in ((2.0, 768 * 28 * 28), (1.0, 448 * 448)):
+            for fps in (2.0, 1.0, 0.5):
                 try:
-                    inputs, kw_used = build_inputs(fps, mp)
+                    inputs, kw_used = build_inputs(fps)
                     n_tok = inputs["input_ids"].shape[1]
                     if n_tok > 30000:
                         perrs.append((f"fps={fps}", f"token 超预算 {n_tok}"))
                         continue
-                    mode = f"fps={fps} max_pixels={mp} tokens={n_tok}"
+                    mode = f"fps={fps} tokens={n_tok}"
                     break
                 except Exception as e:
-                    perrs.append((f"fps={fps} mp={mp}", repr(e)[:200]))
+                    perrs.append((f"fps={fps}", repr(e)[:200]))
             if inputs is None:
                 rec["error"] = f"processor 失败: {perrs}"
                 items_out.append(rec)
