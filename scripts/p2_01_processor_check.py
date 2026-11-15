@@ -170,7 +170,7 @@ def main() -> int:
         evidence["flash_unit"] = keep["flash_uid"]
         evidence["beep_unit"] = keep["beep_uid"]
 
-        from mlx_vlm import load_processor
+        from mlx_vlm.utils import load_processor  # 0.7.12 的 load_processor 在 utils，不在包顶层
         from mlx_vlm.models.qwen3_omni_moe.omni_utils import prepare_omni_inputs
 
         processor = load_processor(args.model)
