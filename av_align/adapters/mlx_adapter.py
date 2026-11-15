@@ -11,6 +11,7 @@
   （平局视频先行），音频 = arange；按值域分块（seconds_per_chunk=2.0 → 26 位置单位/窗），
   与后端 A 同构、时间分辨率不同；
 - 入口 `omni_utils.prepare_omni_inputs(processor, conversation, use_audio_in_video)`；
+- **16 GiB 内存超限（2026-11-15 HF 实测）**：官方最低位宽 4bit=20.33 GiB，无更低——16 GiB 机型按 §5 降级（A 单后端 + 附 B 勘察）；两阶段 Mac 运行包见工作区 `p2-01-mac-运行包/`；
 - 注意 #1620 修复：feature_attention_mask（样本域）→ audio_feature_lengths（mel 帧域）需换算。
 
 对照语义（v2 §4.2-4）：A/B 为同家族两代实现对照；"实现级差异"与"模型代际差异"分开表述。
@@ -36,7 +37,7 @@ def layout_kwargs_for_backend(
     return {"video_block_s": seconds_per_chunk, "within_block_order": "video_first"}
 
 
-def verify_on_metal(model_id: str = "mlx-community/Qwen3-Omni-3B-4bit"):
+def verify_on_metal(model_id: str = "mlx-community/Qwen3-Omni-30B-A3B-Instruct-4bit"):  # 实测 20.33 GiB，16 GiB 需更低位宽或更大内存
     """在 Apple Silicon 上执行 A/B 对照（P2-01 的执行体，本机无法运行）。
 
     步骤：
