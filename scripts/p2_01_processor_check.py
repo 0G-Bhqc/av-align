@@ -172,8 +172,13 @@ def main() -> int:
 
         from mlx_vlm.utils import load_processor  # 0.7.12 的 load_processor 在 utils，不在包顶层
         from mlx_vlm.models.qwen3_omni_moe.omni_utils import prepare_omni_inputs
-
-        processor = load_processor(args.model)
+        from huggingface_hub import snapshot_download
+        local_repo = pathlib.Path(snapshot_download(
+            args.model, allow_patterns=["*.json", "*.txt", "*.model", "*.jinja",
+                                        "tokenizer*", "preprocessor*", "processor*"]))
+        # 勘察怪癖（0.7.12）：tokenizer_utils L475 对 model_path 做 Path / 拼接，必须传本地 Path；
+        # snapshot 排除 safetensors，只拉配置/tokenizer（约 12 MB）
+        processor = load_processor(local_repo)
         cfg_path = pathlib.Path(processor.tokenizer.name_or_path or "") / "config.json"
         pip, spc = 13.0, 2.0
         try:
