@@ -69,6 +69,7 @@ AV_ALIGN_OFFLINE=1 .venv/Scripts/python.exe -m pytest tests -q
 - [x] P1-02 后端 A 双级只读重述 + v2 后端快照记录（`av_align.backend_snapshot/0-draft`）
 - [x] P0-01 原生/显式回放等价 + 位置干预（Colab CLI 通道，bhqc20 A100，A1–A6 全过；§4.2-2 闭环）
 - [x] G4 发布件（已验证能力范围）：CITATION.cff、许可审计（docs/license-audit.md）、干净环境安装验证 20/20（docs/release/clean-install-verification.md，发现并修复 F1/F2 元数据缺陷）、范围与限制表（docs/release/scope-limitations.md）
+- [x] 命名定稿：av_align（2026-11-15 用户决定）；RELEASE_NOTES_v0.2.0.md 与本地 tag v0.2.0 就绪，远端推送待公开确认
 - [ ] P0-03 错例回放（需研究线首轮错例；开会话首个动作 = E1 同基座重存，脚本已备）
 - [ ] P2-01 后端 B Metal 执行（`av_align/adapters/mlx_adapter.py::verify_on_metal` 内置步骤）
 - [ ] P2-02 后端 C 选型冻结（docs/backend-c-candidates.md）
