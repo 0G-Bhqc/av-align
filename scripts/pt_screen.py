@@ -63,13 +63,18 @@ def main():
 
     # 内核持久化防御：清理上次运行残留的 GPU 大张量（实测 38 万 token 输入会占满 40GiB）
     import gc
-    for stale in ("inputs", "replay_inputs", "out1", "out2", "out_replay", "out_pass",
-                  "out_single", "out_both", "model_inputs", "pos_native", "LOGITS_ROW"):
-        if stale in globals():
-            try:
-                del globals()[stale]
-            except Exception:
-                pass
+    stale_names = ("inputs", "replay_inputs", "out1", "out2", "out_replay", "out_pass",
+                   "out_single", "out_both", "model_inputs", "pos_native", "LOGITS_ROW",
+                   "ROW_TRUE", "P", "POS_SINGLE", "POS_BOTH", " thinker_output")
+    try:
+        ns = get_ipython().user_ns  # exec -f 在 IPython 内核中运行：清理内核命名空间的残留张量
+        for stale in stale_names:
+            ns.pop(stale, None)
+        for k in list(ns):
+            if k.startswith("_") and isinstance(ns[k], torch.Tensor) and ns[k].numel() > 1_000_000:
+                ns.pop(k, None)
+    except Exception:
+        pass
     gc.collect()
     torch.cuda.empty_cache()
     import transformers
