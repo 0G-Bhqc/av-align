@@ -60,6 +60,18 @@ def main():
     import cv2
     import librosa
     import torch
+
+    # 内核持久化防御：清理上次运行残留的 GPU 大张量（实测 38 万 token 输入会占满 40GiB）
+    import gc
+    for stale in ("inputs", "replay_inputs", "out1", "out2", "out_replay", "out_pass",
+                  "out_single", "out_both", "model_inputs", "pos_native", "LOGITS_ROW"):
+        if stale in globals():
+            try:
+                del globals()[stale]
+            except Exception:
+                pass
+    gc.collect()
+    torch.cuda.empty_cache()
     import transformers
     if transformers.__version__ != "4.57.6":
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", PIN], check=True)
