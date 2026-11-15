@@ -25,7 +25,7 @@
 
 | # | 内容 | 状态 |
 |---|---|---|
-| E1 | 证据 npz 中 pos_native（True 分支基座）与 pos_single/pos_both（False 分支基座）基底混用，npz 不能独立复核位移精确性；A4 以运行时记录（位移 [25]）佐证 | **P0-03 开启 Colab 会话时的首个动作**：同基座重存四组张量（预案脚本 `artifacts/音画时间机制/p0-01-colab-证据/20261115/E1-remediate.py`） |
+| E1 | ~~npz 基底混用~~ **已修复闭环（2026-11-15）**：E1-remediate.py 短会话执行，四组张量同基座（False/mel602）重存，npz 独立复核位移（单路 +25 仅视频、0 其余；共同平移 +25 仅媒体）与 passthrough 位级 0.0 | ✅ 关闭；后续会话可直接以 tensors_e1_fixed.npz 为准 |
 | Q1 | transformers 4.57.6 原生默认 `use_audio_in_video=False` 分支；官方 docstring 用法（=True）改变答案（D→B） | 已实测登记（report.json alignment_matrix）——接口语义敏感性，交研究线引用 |
 | Q2 | False 分支对 audio_seqlens 候选值（600/300/150）均位级一致——交错 input_ids 下位置赋值对音频长度不敏感 | 已实测登记（怪癖） |
 | Q3 | 5.23 已废弃 `use_audio_in_video`（v5.25 移除）；适配器须按版本分支（`load_audio_from_video` / `audio_seqlens` 纯数字列表） | 双路径兼容已实现并记录（P0-01 勘察记录 §3） |
