@@ -129,25 +129,42 @@ def main():
                 {"type": "text", "text": question + " Answer with the option's letter from A, B, C directly."},
             ]}]
             text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-            # token 预算：720p 帧 × fps 受 max_pixels 约束；超 30k 降 fps 重试
-            def build_inputs(fps):
-                # 勘察（4.57.6）：顶参 fps 不生效（全帧采样 → OOM），fps 必须走 videos_kwargs
-                kw = dict(videos=[path], audio=[audio.astype("float32")],
-                          use_audio_in_video=True, videos_kwargs={"fps": fps})
-                return processor(text=[text], **kw, return_tensors="pt").to("cuda"), kw
+            # 勘察（4.57.6 实测三次）：fps 无论顶参或 videos_kwargs 均不生效（1058 帧全采样
+            # → 38 万 token 超上下文/OOM）。改为 cv2 按 fps 预采样帧数组，videos_kwargs fps
+            # 只用于 second_per_grid 计算（P0-01 已验证）。
+            import cv2
+            cap = cv2.VideoCapture(path)
+            src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            cap.release()
             inputs, mode = None, None
             perrs = []
-            for fps in (2.0, 1.0, 0.5):
+            for fps in (2.0, 1.0):
+                step = max(1, int(round(src_fps / fps)))
+                cap = cv2.VideoCapture(path)
+                _frames = []
+                idx = 0
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    if idx % step == 0:
+                        _frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    idx += 1
+                cap.release()
+                video_tc = np.stack(_frames).transpose(0, 3, 1, 2)  # (T, C, H, W)
+                kw = dict(videos=[video_tc], audio=[audio.astype("float32")],
+                          use_audio_in_video=True, videos_kwargs={"fps": fps})
                 try:
-                    inputs, kw_used = build_inputs(fps)
+                    inputs = processor(text=[text], **kw, return_tensors="pt").to("cuda")
                     n_tok = inputs["input_ids"].shape[1]
                     if n_tok > 30000:
-                        perrs.append((f"fps={fps}", f"token 超预算 {n_tok}"))
+                        perrs.append((f"fps={fps} 帧数={len(_frames)}", f"token 超预算 {n_tok}"))
+                        del inputs
                         continue
-                    mode = f"fps={fps} tokens={n_tok}"
+                    mode = f"fps={fps} 帧数={len(_frames)} tokens={n_tok}"
                     break
                 except Exception as e:
-                    perrs.append((f"fps={fps}", repr(e)[:200]))
+                    perrs.append((f"fps={fps} 帧数={len(_frames)}", repr(e)[:200]))
             if inputs is None:
                 rec["error"] = f"processor 失败: {perrs}"
                 items_out.append(rec)
