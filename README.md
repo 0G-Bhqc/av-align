@@ -43,6 +43,18 @@ plan2 = build_layout(video, audio, interventions=[
 
 后端 A（Transformers 5.23 / Qwen2.5-Omni）双级只读重述已通过（CPU、无权重）：processor 占位串（后端自身代码）与 L1 期望序列一致；tiny-config `get_rope_index` 时间位置逐运行核验一致（视频 patch 值截断、音频稠密）。
 
+## 复现
+
+```bash
+# Windows / Git Bash；macOS 同理（建议 venv 放本机非同步路径）
+uv venv --python 3.11 .venv
+uv pip install --python .venv/Scripts/python.exe -e ".[test]"       # L1 + 性质测试，纯 CPU
+.venv/Scripts/python.exe -m pytest tests -q                          # 20 项（性质 6 + 契约/schema 6 + 后端 A 4 + 常量 1 + 分块 1 等）
+
+# 后端 A 四项需 HF 网络（processor 配置文件，数 MB，不下载权重）；离线跳过：
+AV_ALIGN_OFFLINE=1 .venv/Scripts/python.exe -m pytest tests -q
+```
+
 ## 仓库纪律
 
 - 仓库在本地磁盘（`D:\Develop\av_align`），不进 Google Drive 同步目录；Drive 只放文档与归档。
