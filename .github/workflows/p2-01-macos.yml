@@ -13,7 +13,7 @@ permissions:
   contents: read
 jobs:
   processor-check:
-    runs-on: macos-14   # Apple Silicon（M1），真 MLX/Metal 环境
+    runs-on: macos-latest   # Apple Silicon（arm64），真 MLX/Metal 环境
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
