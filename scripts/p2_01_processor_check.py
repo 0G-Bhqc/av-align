@@ -255,8 +255,10 @@ def main() -> int:
             else:
                 evidence["packaging"] = {"status": "未验证", "reason": "video_grid_thw 不可得"}
     except Exception as e:
+        import traceback
         hard_error = f"{type(e).__name__}: {repr(e)[:400]}"
         evidence["hard_error"] = hard_error
+        evidence["traceback_tail"] = traceback.format_exc()[-1600:]
 
     OUTPUT.mkdir(parents=True, exist_ok=True)
     report = OUTPUT / "report.json"
