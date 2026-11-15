@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "av_align"
-version = "0.1.0"
+version = "0.2.0"
 description = "音画时间对齐算子：显式音画 token 时间布局 + 干预算子，跨后端只读重述（av_align.layout/1）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,7 +15,8 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 test = ["pytest>=8"]
 # 后端 A（Transformers）：CPU 级验证即可运行 processor 与 get_rope_index（tiny-config 技巧，无需模型权重）
-transformers = ["torch>=2.2", "transformers>=4.52"]
+transformers = ["torch>=2.2", "transformers>=4.52", "pillow>=9.0", "torchvision>=0.15"]
+# pillow/torchvision：Qwen2VL 图像/视频 processor 必需（干净环境验证 2026-11-15 发现缺失）
 # 后端 B（MLX）：仅 Apple Silicon 可运行；本包不声明其依赖，见 docs/backend-b.md
 mlx = []
 

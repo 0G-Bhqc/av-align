@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+title: "av_align: 多模态大模型的音画时间对齐算子（Audio-Visual Temporal Alignment Operator for Multimodal LLMs）"
+message: "使用本算子时请引用本文目，并同时注明所用布局 schema 版本与后端。"
+type: software
+authors:
+  - name: "av_align contributors"
+    note: "命名待定（研发方案 §1）；公开发布前补齐个人或团队署名与 ORCID。"
+version: "0.2.0"
+date-released: "2026-11-15"
+license: Apache-2.0
+abstract: >-
+  显式音画时间对齐算子：把多模态大模型输入中音频/视频 token 的源媒体时间、请求施加的
+  时间布局与模型实际收到的位置和顺序记录为可核对的版本化布局（av_align.layout/1，
+  整数纳秒、稳定单元 ID、源时间/目标时间分离），提供 passthrough / shift_both /
+  reindex / swap 四个干预算子与逐单元音画配对表，并以只读方式重述 Transformers 与
+  MLX 后端的打包与位置编码（Qwen2.5-Omni / Qwen3-Omni 家族）。布局核心为纯 NumPy、
+  平台无关、CPU 可测。
+keywords:
+  - multimodal large language models
+  - audio-visual alignment
+  - temporal grounding
+  - position encoding
+  - TMRoPE
+  - reproducibility
+notes: >-
+  引用时请注明：布局 schema 版本（av_align.layout/1）、验证过的后端与版本
+  （Transformers 4.57.6 / 5.23.0，Qwen/Qwen2.5-Omni-3B @ f75b40e3da2003cdd6e1829b1f420ca70797c34e）、
+  以及立项文档《多模态音画时间对齐算子研发与发布方案》（2026-11-15 v2）。
+  仓库当前为本地私有（Apache-2.0，G4 发布门）；公开发布时补充 repository-code 与 preferred-citation。

@@ -67,7 +67,9 @@ AV_ALIGN_OFFLINE=1 .venv/Scripts/python.exe -m pytest tests -q
 - [x] P0-01 Transformers 5.23.0 实测勘察（v2 §1 A 轨补充；4.57.6 仍是 G2 全前向版本依据）——记录在工作区 `artifacts/音画时间机制/P0-01-transformers-勘察记录.md`
 - [x] P0-02 mlx-vlm 0.7.12 勘察：确认无 qwen2_5_omni（v2 §1 B 轨）；B 适配器改 qwen3_omni_moe
 - [x] P1-02 后端 A 双级只读重述 + v2 后端快照记录（`av_align.backend_snapshot/0-draft`）
-- [ ] P0-03 原生/显式回放等价与错例回放（需 3B 权重，Colab CUDA 或本机下载）
+- [x] P0-01 原生/显式回放等价 + 位置干预（Colab CLI 通道，bhqc20 A100，A1–A6 全过；§4.2-2 闭环）
+- [x] G4 发布件（已验证能力范围）：CITATION.cff、许可审计（docs/license-audit.md）、干净环境安装验证 20/20（docs/release/clean-install-verification.md，发现并修复 F1/F2 元数据缺陷）、范围与限制表（docs/release/scope-limitations.md）
+- [ ] P0-03 错例回放（需研究线首轮错例；开会话首个动作 = E1 同基座重存，脚本已备）
 - [ ] P2-01 后端 B Metal 执行（`av_align/adapters/mlx_adapter.py::verify_on_metal` 内置步骤）
 - [ ] P2-02 后端 C 选型冻结（docs/backend-c-candidates.md）
 - [ ] G4 发布（CITATION.cff、安装验证、复现命令）
