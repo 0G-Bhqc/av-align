@@ -55,6 +55,26 @@ uv pip install --python .venv/Scripts/python.exe -e ".[test]"       # L1 + 性�
 AV_ALIGN_OFFLINE=1 .venv/Scripts/python.exe -m pytest tests -q
 ```
 
+### P0-03：只在 CPU 上检查真实音轨
+
+从仓库根目录运行（Git Bash；POSIX 把 `Scripts/python.exe` 换成 `bin/python`）：
+
+```bash
+uv venv --python 3.11 .venv
+PY=.venv/Scripts/python.exe
+uv pip install --python "$PY" -e '.[test]' imageio-ffmpeg
+clips=$(mktemp -d)
+"$PY" scripts/make_replay_pair.py "$clips"
+"$PY" scripts/p0_03_replay.py --inspect-media "$clips/high-before.mp4" "$clips/high-after.mp4" "$clips/high-before.mp4"
+AV_ALIGN_OFFLINE=1 HF_HUB_OFFLINE=1 "$PY" -m pytest tests -q -rs
+```
+
+两段原创短片均为 2 秒、12 fps；第二段直接复制第一段的视频流。白方块在 1.00 秒闪现。第一段的提示音依次为 880 Hz（0.50 秒）、440 Hz（1.50 秒）；第二段频率互换。因此“高音在闪光之前还是之后？”的参考答案分别为“之前”和“之后”。夹具只在本地生成，不下载素材，不覆盖已有短片。
+
+`--inspect-media` 和回放共用解码函数：按容器时间戳采成 8 帧（4 fps），取源音轨转为 16 kHz 单声道 float32；无音轨即报错，不补造静音。上面三行结果的 `rgb24_sha256` 应全相同，`pcm_f32le_sha256` 应首尾相同而中间不同。测试另以频谱核对真实提示音，并在同一路径替换文件后重读。系统有 FFmpeg 时无需 `imageio-ffmpeg`；没有时使用该 wheel 自带的二进制。
+
+这只验证 CPU 解码、时间和 processor 入参约定，不是模型答对或 GPU 回放通过的证据。Colab 回放入口仍只需 `scripts/p0_03_replay.py` 和源媒体，不需要生成器或仓库包；调用参数见脚本头部。完整提示（含选项文本）由 `QUESTION` 原样传入，`OPTIONS` 只指定评分字母。每次回放的报告和清单位于独立的 `OUTDIR/日期/run-*/`，以脚本打印的 `EVIDENCE` 路径为准。
+
 ## 关于工作区引用
 
 文中部分勘察/证据链接指向本地工作区归档（`artifacts/音画时间机制/…`，Google Drive 同步目录）——**这些归档不随仓库发布**；仓库内 `docs/` 为自包含部分（schema、许可审计、发布验证、限制表、差异表）。需要证据副本请查阅 Drive 归档或联系作者。
