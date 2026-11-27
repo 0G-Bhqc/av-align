@@ -12,8 +12,8 @@
   colab upload -s avalign-p003 <错例媒体文件> /content/media/<文件名>
   colab exec -s avalign-p003 -f /content/p0_03_replay.py \
       --env MEDIA=/content/media/<文件名> \
-      --env QUESTION='研究线确认的问题文本' \
-      --env OPTIONS='A) … | B) … | C) … | D) …' \
+      --env QUESTION='研究线确认的完整问题（含选项文本）' \
+      --env OPTIONS='A|B|C|D' \
       --env DELTA_UNITS=25 --timeout 600
   colab download -s avalign-p003 /content/p0_03_evidence/<日期> <本地目标>
   colab stop -s avalign-p003
@@ -27,12 +27,14 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
-import wave
+import tempfile
 
 import numpy as np
 
@@ -45,6 +47,88 @@ QUESTION = os.environ.get("QUESTION", "")
 OPTIONS_RAW = os.environ.get("OPTIONS", "A|B|C|D")
 DELTA_UNITS = int(os.environ.get("DELTA_UNITS", "25"))
 OUT = pathlib.Path(os.environ.get("OUTDIR", "/content/p0_03_evidence")) / datetime.datetime.now().strftime("%Y%m%d")
+
+
+SAMPLE_FPS = 4.0
+AUDIO_RATE = 16000
+
+
+def ffmpeg_exe():
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+    except ImportError as e:
+        raise RuntimeError("需要 PATH 上的 ffmpeg 或 imageio-ffmpeg") from e
+    return get_ffmpeg_exe()
+
+
+def decode_media(media):
+    """Read the first video/audio streams on the container clock; no intermediate files."""
+    path = pathlib.Path(media).resolve(strict=True)
+    cmd = [ffmpeg_exe(), "-nostdin", "-loglevel", "error", "-xerror", "-copyts",
+           "-start_at_zero", "-i", str(path)]
+
+    def stream(selector, *args):
+        p = subprocess.run([*cmd, "-map", selector, *args, "pipe:1"], capture_output=True)
+        if p.returncode or not p.stdout:
+            raise ValueError(f"{path}: cannot decode {selector}: {p.stderr.decode(errors='replace')[-500:]}")
+        return p.stdout
+
+    # first_pts=0 preserves a delayed track's initial gap, without inventing a missing track.
+    pcm = stream("0:a:0", "-af", f"aresample={AUDIO_RATE}:async=1:first_pts=0",
+                 "-ac", "1", "-f", "f32le")
+    audio = np.frombuffer(pcm, dtype="<f4").astype(np.float32, copy=True)
+    # Sample by PTS, not by relabelling every source frame as 4 fps. FFmpeg's P6
+    # framing supplies the post-rotation dimensions without ffprobe or a second decoder.
+    ppm = io.BytesIO(stream("0:v:0", "-vf", f"fps={SAMPLE_FPS}:start_time=0:round=up",
+                            "-pix_fmt", "rgb24", "-c:v", "ppm", "-f", "image2pipe"))
+    frames = []
+    while magic := ppm.readline():
+        if magic != b"P6\n":
+            raise ValueError(f"{path}: invalid FFmpeg PPM frame")
+        w, h = map(int, ppm.readline().split())
+        if ppm.readline() != b"255\n":
+            raise ValueError(f"{path}: expected 8-bit RGB")
+        frames.append(np.frombuffer(ppm.read(h * w * 3), np.uint8).reshape(h, w, 3))
+    return np.stack(frames).transpose(0, 3, 1, 2), audio
+
+
+def decoded_summary(video, audio):
+    rgb = np.ascontiguousarray(video.transpose(0, 2, 3, 1))
+    return {"frames": len(video), "fps": SAMPLE_FPS, "audio_samples": len(audio),
+            "sample_rate": AUDIO_RATE, "rgb24_sha256": hashlib.sha256(rgb).hexdigest(),
+            "pcm_f32le_sha256": hashlib.sha256(audio.astype("<f4", copy=False)).hexdigest()}
+
+
+def processor_inputs(processor, media, question, video, audio):
+    # 4.57.6: the video part consumes the separately supplied audio once.
+    conversation = [{"role": "user", "content": [
+        {"type": "video", "video": str(media)}, {"type": "text", "text": question}]}]
+    text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+    return processor(text=[text], videos=[video], audio=[audio], use_audio_in_video=True,
+                     videos_kwargs={"fps": SAMPLE_FPS}, return_tensors="pt")
+
+
+def option_ids(tokenizer, raw):
+    result = {}
+    for option in raw.split("|"):
+        label = option.partition(")")[0].strip()
+        if len(label) != 1 or not "A" <= label <= "Z" or label in result:
+            raise ValueError(f"expected unique option letters, got {option!r}")
+        ids = [tokenizer.encode(s, add_special_tokens=False) for s in (label, " " + label)]
+        result[label] = list(dict.fromkeys(seq[0] for seq in ids
+                                           if len(seq) == 1 and seq[0] != tokenizer.unk_token_id))
+        if not result[label]:
+            raise ValueError(f"no single-token spelling for {label}")
+    return result
+
+
+def score_options(row, options):
+    # Best next-token logit across valid spellings (e.g. 'A' and ' A').
+    scores = {label: row[ids].max().item() for label, ids in options.items()}
+    return {"option_logits": scores, "argmax": max(scores, key=scores.get)}
 
 
 def t_sha(t) -> str:
@@ -75,48 +159,13 @@ def main() -> int:
         assert pathlib.Path(MEDIA).exists(), f"错例媒体不存在: {MEDIA}"
         assert QUESTION, "需通过 --env QUESTION 提供研究线确认的问题文本"
 
-        # ② 固定 revision 权重（缓存命中即快）
+        # ② 先解码验证同源音画；无音轨/坏媒体在加载权重前明确失败。
+        video_tc, audio_stream = decode_media(MEDIA)
+        evidence["decoded"] = decoded_summary(video_tc, audio_stream)
+
+        # ③ 固定 revision 权重（缓存命中即快）
         from huggingface_hub import snapshot_download
         model_path = snapshot_download(MODEL_ID, revision=REVISION)
-
-        # ③ 解码：视频帧（cv2）+ 容器音轨（librosa）——P0-01 修复链的固化
-        import cv2, librosa
-        cap = cv2.VideoCapture(MEDIA)
-        frames = []
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        cap.release()
-        video_tc = np.stack(frames).transpose(0, 3, 1, 2)  # (T, C, H, W)
-        work = pathlib.Path("/tmp") / "av_align_p0_03"
-        work.mkdir(exist_ok=True)
-        raw_video, wav_path = work / "v.mp4", work / "a.wav"
-        if not wav_path.exists():
-            import imageio.v2 as imageio
-            imageio.mimsave(raw_video, [f for f in frames], fps=4)  # 抽帧率仅用于容器化；音频独立传入
-            try:
-                import imageio_ffmpeg
-                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            except Exception:
-                ffmpeg_exe = "ffmpeg"
-            # 静音音轨容器化（错例音轨直接经 librosa 传入 processor）
-            sr0 = 16000
-            silence = np.zeros((sr0 * 2,), dtype=np.float32)
-            with wave.open(str(work / "sil.wav"), "wb") as wf:
-                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr0)
-                wf.writeframes((silence * 32767).astype("<i2").tobytes())
-            mux = sp.run([ffmpeg_exe, "-y", "-loglevel", "error", "-i", str(raw_video),
-                          "-i", str(work / "sil.wav"), "-c:v", "copy", "-c:a", "aac",
-                          "-shortest", str(work / "av_silent.mp4")], capture_output=True, text=True)
-            assert mux.returncode == 0, mux.stderr[-300:]
-            av_path = work / "av_silent.mp4"
-        audio_stream, _ = librosa.load(str(work / "a.wav"), sr=None, mono=True) \
-            if (work / "a.wav").exists() else None
-        # 错例音轨直接从源容器抽取（保真）
-        audio_stream, _ = librosa.load(MEDIA, sr=16000, mono=True)
-        evidence["decoded"] = {"frames": int(video_tc.shape[0]), "audio_samples": int(len(audio_stream))}
 
         # ④ 模板 + processor（use_audio_in_video=True + 音频单独传入）
         from transformers import AutoProcessor, Qwen2_5OmniThinkerForConditionalGeneration
@@ -124,30 +173,8 @@ def main() -> int:
         thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
             model_path, torch_dtype=torch.bfloat16).to("cuda")
         thinker.eval()
-        conversation = [{"role": "user", "content": [
-            {"type": "video", "video": str(work / "av_silent.mp4")},
-            {"type": "audio", "audio": audio_stream},
-            {"type": "text", "text": QUESTION},
-        ]}]
-        text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
-        inputs, proc_mode = None, None
-        errs = []
-        for name, kw in (
-            ("direct", dict(videos=[video_tc], audio=[audio_stream.astype("float32")],
-                            use_audio_in_video=True, fps=4.0)),
-            ("vkw", dict(videos=[video_tc], audio=[audio_stream.astype("float32")],
-                         videos_kwargs={"fps": 4.0, "use_audio_in_video": True})),
-        ):
-            try:
-                inputs = processor(text=[text], **kw, return_tensors="pt").to("cuda")
-                proc_mode = name
-                break
-            except Exception as e:
-                errs.append((name, type(e).__name__, repr(e)[:300]))
-        if inputs is None:
-            raise RuntimeError(f"processor 全部失败: {errs}")
-        evidence["processor_mode"] = proc_mode
-        evidence["processor_attempt_errors"] = errs
+        inputs = processor_inputs(processor, MEDIA, QUESTION, video_tc, audio_stream).to("cuda")
+        evidence["processor_mode"] = "video_part+audio_kwarg"
         INPUTS_FP = {k: t_sha(v) for k, v in inputs.items()}
 
         # ⑤ 原生 ×2（冻结抖动）→ 显式回放（位级自证）
@@ -163,21 +190,14 @@ def main() -> int:
         JITTER = (out2.logits[0, -1].float() - out1.logits[0, -1].float()).abs().max().item()
         FINAL_IDX = int((inputs["attention_mask"].sum(1) - 1).item())
         LOGITS_ROW = out1.logits[0, FINAL_IDX].float()
-        tok = processor.tokenizer
-        def opt_ids(letter):
-            return [tok.convert_tokens_to_ids(s) for s in (letter, " " + letter)
-                    if tok.convert_tokens_to_ids(s) is not None]
-        OPTIONS = {L: opt_ids(L) for L in OPTIONS_RAW.replace(" ", "").split("|") if L}
+        OPTIONS = option_ids(processor.tokenizer, OPTIONS_RAW)
         replay_inputs = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in inputs.items()}
         REPLAY_FP = {k: t_sha(v) for k, v in replay_inputs.items()}
         discrete_same = {k: INPUTS_FP[k] == REPLAY_FP[k] for k in INPUTS_FP}
         with torch.no_grad():
             out_replay = thinker(**replay_inputs, use_cache=False)
         DIFF_REPLAY = (out_replay.logits[0, FINAL_IDX].float() - LOGITS_ROW).abs().max().item()
-        ARGMAX_NATIVE = max(OPTIONS, key=lambda L: LOGITS_ROW[OPTIONS[L]].item())
-        evidence["native"] = {"jitter": JITTER, "option_ids": OPTIONS,
-                              "option_logits": {L: LOGITS_ROW[OPTIONS[L]].item() for L in OPTIONS},
-                              "argmax": ARGMAX_NATIVE}
+        evidence["native"] = {"jitter": JITTER, "option_ids": OPTIONS, **score_options(LOGITS_ROW, OPTIONS)}
         evidence["replay"] = {"discrete_same": all(discrete_same.values()),
                               "logits_max_abs_diff": DIFF_REPLAY}
         # 验收 A2：回放差 ≤ 抖动（jitter=0 时要求位级一致）
@@ -204,9 +224,7 @@ def main() -> int:
         assert passthrough_diff == 0.0, f"passthrough 非位级一致: {passthrough_diff}"
         def row(o):
             r = o.logits[0, FINAL_IDX].float()
-            return {"logits_max_abs_diff": (r - LOGITS_ROW).abs().max().item(),
-                    "argmax": max(OPTIONS, key=lambda L: r[OPTIONS[L]].item()),
-                    "option_logits": {L: r[OPTIONS[L]].item() for L in OPTIONS}}
+            return {"logits_max_abs_diff": (r - LOGITS_ROW).abs().max().item(), **score_options(r, OPTIONS)}
         evidence["intervention"] = {
             "delta_units": DELTA_UNITS, "base": "False/mel%d" % int(mel.item()),
             "passthrough_diff": passthrough_diff, "rope_deltas": int(rope_deltas.item()),
@@ -224,19 +242,29 @@ def main() -> int:
         evidence["hard_error"] = hard_error
         evidence["traceback_tail"] = traceback.format_exc()[-1600:]
 
-    OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / "report.json").write_text(json.dumps(evidence, ensure_ascii=False, indent=2),
-                                     encoding="utf-8")
-    files = sorted(p for p in OUT.iterdir() if p.is_file())
-    manifest = {"schema": "av_align.p0_03_replay_manifest/0-draft",
-                "generated": evidence["date"],
-                "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}}
-    (OUT / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
-                                       encoding="utf-8")
-    print("EVIDENCE:", OUT)
+    out = write_evidence(OUT, evidence)
+    print("EVIDENCE:", out)
     print(json.dumps(evidence, ensure_ascii=False, indent=2)[:2200])
     return 1 if hard_error else 0
 
 
+def write_evidence(day_dir, evidence):
+    # The same day may include both clips (or a failed retry). Never re-hash an old manifest.
+    day_dir.mkdir(parents=True, exist_ok=True)
+    out = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=day_dir))
+    report = out / "report.json"
+    report.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest = {"schema": "av_align.p0_03_replay_manifest/0-draft", "generated": evidence["date"],
+                "files": {report.name: hashlib.sha256(report.read_bytes()).hexdigest()}}
+    (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    if sys.argv[1:2] == ["--inspect-media"]:
+        if not sys.argv[2:]:
+            sys.exit("usage: p0_03_replay.py --inspect-media FILE [FILE ...]")
+        for path in sys.argv[2:]:
+            print(json.dumps({"media": path, **decoded_summary(*decode_media(path))}, ensure_ascii=False))
+    else:
+        sys.exit(main())
